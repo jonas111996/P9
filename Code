@@ -1,0 +1,751 @@
+df <- Disaster_with_web_coords_CAPITALS_FILL_AMERICAS_SPLIT_from_1_
+
+
+
+df_Africa <- subset(Disaster, Region == "Africa")
+
+df_flood <- subset(df_Africa, `Disaster Type` == "Flood")
+
+df_flood$number <- 1L
+
+
+df_flood_Africa <- subset(df_flood, `Start Year` > 1949 & `Start Year` < 2019)
+
+
+
+Flood <- Floods_kordinater
+
+median(Flood$Magnitude, na.rm = TRUE)
+
+
+
+
+dfA <- Flood               # has: Longitude, Latitude, Start Year
+dfB <- Rp95_Regn                    # has: longitude, latitude, time, EHF_HWN
+
+dfB <- Highest_daily_temperatur
+
+dfB <- Annual_Rain
+
+
+
+# Optional IDs
+dfA$id <- seq_len(nrow(dfA))
+dfB$id <- seq_len(nrow(dfB))
+
+area_km2 <- 19235
+radius_km <- sqrt(area_km2 / pi) # ≈ 28.5416
+radius_m  <- radius_km * 1000
+
+get_year <- function(x) {
+  # Date
+  if (inherits(x, "Date")) return(as.integer(format(x, "%Y")))
+  # POSIXct/POSIXlt
+  if (inherits(x, "POSIXt")) return(as.integer(format(x, "%Y")))
+  # Numeric (assume Excel serial date)
+  if (is.numeric(x)) {
+    d <- as.Date(x, origin = "1899-12-30")
+    return(as.integer(format(d, "%Y")))
+  }
+  # Character: try POSIXct, then Date; else take first 4 digits
+  d1 <- suppressWarnings(as.POSIXct(x, tz = "UTC"))
+  d2 <- suppressWarnings(as.Date(x))
+  d  <- ifelse(is.na(d1), d2, as.Date(d1))
+  out <- as.integer(format(d, "%Y"))
+  na_idx <- is.na(out)
+  if (any(na_idx)) out[na_idx] <- suppressWarnings(as.integer(substr(as.character(x[na_idx]), 1, 4)))
+  out
+}
+
+A_year <- as.integer(dfA[["Start Year"]])
+B_year <- get_year(dfB$time)
+
+# ===== Build sf point layers (WGS84) =====
+A_sf <- st_as_sf(dfA, coords = c("Longitude", "Latitude"), crs = 4326, remove = FALSE)
+B_sf <- st_as_sf(dfB, coords = c("longitude", "latitude"), crs = 4326, remove = FALSE)
+
+# ===== Pre-index rows by year (vectors) =====
+dfA_idx <- tibble(A_row = seq_len(nrow(dfA)), A_year = A_year)
+dfB_idx <- tibble(B_row = seq_len(nrow(dfB)), B_year = B_year)
+
+years_in_A <- sort(unique(stats::na.omit(A_year)))
+
+# ===== Helper: fast nearest same-year fallback (ignoring radius) =====
+nearest_sameyear_for_year <- function(y, A_rows_y) {
+  B_rows_y <- dfB_idx$B_row[dfB_idx$B_year == y]
+  if (!length(A_rows_y) || !length(B_rows_y)) {
+    return(tibble(A_row = integer(), B_row = integer(), A_year = integer(), B_year = integer()))
+  }
+  # Single nearest per A_row (fast) — avoids building full distance matrices
+  nn_idx <- st_nearest_feature(A_sf[A_rows_y, ], B_sf[B_rows_y, ])
+  tibble(
+    A_row = A_rows_y,
+    B_row = B_rows_y[nn_idx],
+    A_year = y,
+    B_year = y
+  )
+}
+
+# ===== Main per-year selection (low complexity) =====
+selected_pairs_list <- vector("list", length(years_in_A))
+names(selected_pairs_list) <- as.character(years_in_A)
+
+for (k in seq_along(years_in_A)) {
+  y <- years_in_A[k]
+  A_rows_y <- dfA_idx$A_row[dfA_idx$A_year == y]
+  B_rows_y <- dfB_idx$B_row[dfB_idx$B_year == y]
+  
+  # If there are no B rows in this year at all, we cannot match this year
+  if (!length(B_rows_y) || !length(A_rows_y)) {
+    selected_pairs_list[[k]] <- tibble(A_row = integer(), B_row = integer(),
+                                       A_year = integer(), B_year = integer())
+    next
+  }
+  
+  # Radius join (vectorized) for same year: compute for A_y vs B_y only
+  hits <- st_is_within_distance(A_sf[A_rows_y, ], B_sf[B_rows_y, ], dist = radius_m)
+  has_any <- any(lengths(hits) > 0)
+  
+  if (has_any) {
+    # Keep only in-radius same-year pairs (per your rule, no fallback for that year)
+    # Build pairs compactly
+    A_rep <- rep(seq_along(hits), lengths(hits))
+    B_rep <- unlist(hits, use.names = FALSE)
+    selected_pairs_list[[k]] <- tibble(
+      A_row = A_rows_y[A_rep],
+      B_row = B_rows_y[B_rep],
+      A_year = y,
+      B_year = y
+    )
+  } else {
+    # No A-row in this year has any station within radius -> use nearest same-year station
+    selected_pairs_list[[k]] <- nearest_sameyear_for_year(y, A_rows_y)
+  }
+}
+
+selected_pairs <- bind_rows(selected_pairs_list)
+
+# ===== Summaries (disaster years only) =====
+# 1) Median EHF_HWN across selected B rows for each A_row (per event)
+per_Arow <- selected_pairs |>
+  left_join(dfB |> mutate(B_row = dplyr::row_number()) |> select(B_row, PRCPTOT),
+            by = "B_row") |>
+  group_by(A_row, A_year) |>
+  summarise(EHF_HWN_median_per_A = median(PRCPTOT, na.rm = TRUE), .groups = "drop")
+
+# 2) Final per-year median across A_rows => one value per disaster year
+final_by_year <- per_Arow |>
+  group_by(Year = A_year) |>
+  summarise(EHF_HWN_final = median(EHF_HWN_median_per_A, na.rm = TRUE), .groups = "drop") |>
+  arrange(Year)
+
+# ===== Fill non-disaster years using stations from the most recent prior disaster year =====
+# Build a station id (by coords) to allow matching the same station across years
+dfB <- dfB |>
+  mutate(
+    station_key = paste0(round(longitude, 6), "_", round(latitude, 6)),
+    B_row = dplyr::row_number()
+  )
+
+# Disaster years are exactly the years present in dfA already computed as 'years_in_A'
+disaster_years <- years_in_A
+
+# Which stations were used in each disaster year (from the selected_pairs that you computed)
+pairs_with_keys <- selected_pairs |>
+  left_join(
+    dfB |> select(B_row, station_key),
+    by = "B_row"
+  )
+
+stations_by_disaster_year <- pairs_with_keys |>
+  distinct(A_year, station_key) |>
+  group_by(A_year) |>
+  summarise(station_keys = list(unique(na.omit(station_key))), .groups = "drop")
+
+# All candidate years present in the station data
+all_years_B <- sort(unique(stats::na.omit(B_year)))
+
+# Years with no climate disaster
+years_no_disaster <- setdiff(all_years_B, disaster_years)
+
+# For each non-disaster year y, find the most recent prior disaster year p,
+# then take the median of THIS year's TXx for the stations used in year p.
+filled_nondisaster <- tibble(Year = years_no_disaster) |>
+  mutate(
+    prev_disaster_year = purrr::map_int(
+      Year,
+      ~{
+        prevs <- disaster_years[disaster_years < .x]
+        if (length(prevs)) max(prevs) else NA_integer_
+      }
+    )
+  ) |>
+  left_join(stations_by_disaster_year, by = c("prev_disaster_year" = "A_year")) |>
+  rowwise() |>
+  mutate(
+    EHF_HWN_final = {
+      keys <- station_keys
+      if (is.null(keys) || length(keys) == 0 || all(is.na(keys))) {
+        NA_real_
+      } else {
+        median(dfB$PRCPTOT[B_year == Year & dfB$station_key %in% keys], na.rm = TRUE)
+      }
+    }
+  ) |>
+  ungroup() |>
+  select(Year, EHF_HWN_final)
+
+# ===== Combine disaster-year results with non-disaster fills =====
+final_by_year_complete <- bind_rows(final_by_year, filled_nondisaster) |>
+  arrange(Year)
+
+print(final_by_year_complete, n = nrow(final_by_year_complete))
+
+
+
+
+agg_df <- aggregate(number ~ `Start Year`, data = Flood, sum)
+
+result_mat <- as.matrix(agg_df)
+
+counts_df <- Flood %>%
+  group_by(`Start Year`) %>%
+  summarise(y = sum(number), .groups = "drop")
+
+yrs <- seq(min(counts_df$`Start Year`), max(counts_df$`Start Year`), by = 1)
+counts_full_annualrain <- tibble(`Start Year` = yrs) %>%
+  left_join(counts_df, by = "Start Year") %>%
+  mutate(y = ifelse(is.na(y), 0L, y)) %>%
+  arrange(`Start Year`)
+
+
+df_flood_Africa <- subset(df_flood, `Start Year` > 1949 & `Start Year` < 2019)
+
+counts_full <- subset(counts_full, `Start Year` > 1960)
+
+
+
+y_ts <- ts(counts_full$y, start = min(counts_full$`Start Year`), frequency = 1)
+
+acf(y_ts,lag.max=50)
+
+
+fit_par <- function(p) {
+  tryCatch({
+    fit <- tsglm(sealevelts, model = list(past_obs = p), distr = "poisson")
+    ll  <- as.numeric(logLik(fit))
+    k   <- attr(logLik(fit), "df")     # number of estimated parameters
+    tibble(
+      model  = "PAR",
+      p      = p,
+      logLik = ll,
+      k      = k,
+      AIC    = AIC(fit),
+      BIC    = BIC(fit),
+      HQIC   = -2*ll + 2*k*log(log(length(y_ts)))  # Hannan–Quinn
+    )
+  }, error = function(e) {
+    tibble(model = "PAR", p = p, logLik = NA_real_, k = NA_integer_,
+           AIC = NA_real_, BIC = NA_real_, HQIC = NA_real_)
+  })
+}
+
+
+par_grid <- tibble(p = 1:max_lag)
+res_par  <- map_dfr(par_grid$p, fit_par)
+
+# Results sorted by each criterion
+res_par_aic <- res_par %>% arrange(AIC)
+res_par_bic <- res_par %>% arrange(BIC)
+res_par_hq  <- res_par %>% arrange(HQIC)
+
+print(res_par_aic)
+
+make_fit_par1 <- function(y) {
+  tsglm(y, model = list(past_obs = 1, past_mean = 1), link = "log", distr = "poisson")
+}
+test <- make_fit_par1(y_ts)
+summary(test)
+
+final_by_year1 <- subset(final_by_year, `Year` > 1960)
+
+
+
+library(dplyr)
+
+
+
+final_by_year1 <- final_by_year_adj %>% filter(Year > 1960)
+
+
+
+sea_rise_level <- final_by_year_complete %>%
+  dplyr::filter(Year > 1960, Year < 2019)
+
+sea_rise_levelts <- ts(sea_rise_level)
+sealevelts <- ts(sea_rise_level$EHF_HWN_final, frequency = 1)
+acf(sealevelts)
+
+#####################################
+
+# Fits Poisson tsGLMs with cumulative exogenous lags up to max_lag.
+# For k = 4 -> X = [lag1, lag2, lag3, lag4], etc.
+# Evaluate PARX models with cumulative exogenous lags: for k, use lags 1..k of sealevelts
+# ---- drop-in replacement ----
+# Requires: sandwich, numDeriv (and MASS for ginv fallback if Hessian is singular)
+# install.packages(c("sandwich","numDeriv"))  # if needed
+
+fit_parx_exolags_same_sample <- function(
+    y, sealevelts, max_lag = 16, p = 1, past_mean = 1, do_lrt = TRUE,
+    se_method = c("model","bootstrap","hac"),
+    B = 500,                   # used if se_method = "bootstrap"
+    hac_bw = NULL,              # bandwidth for HAC (if NULL, simple rule-of-thumb)
+    hac_kernel = "Bartlett",    # "Bartlett", "Parzen", "Quadratic"
+    ci_level = 0.95
+) {
+  se_method <- match.arg(se_method)
+  
+  # --- light-weight coercion (handles ts/zoo/xts/numeric/list-wrapped) ---
+  to_numeric_vec <- function(obj, name = "input") {
+    if (is.list(obj) && length(obj) == 1) obj <- obj[[1]]
+    if (is.ts(obj))           return(as.numeric(obj))
+    if (inherits(obj, c("zoo","xts")) && requireNamespace("zoo", quietly = TRUE))
+      return(as.numeric(zoo::coredata(obj)))
+    if (is.data.frame(obj))   obj <- obj[[1]]
+    if (is.matrix(obj))       obj <- obj[, 1]
+    if (!is.atomic(obj)) stop(sprintf("'%s' could not be coerced to numeric vector", name))
+    as.numeric(obj)
+  }
+  
+  y <- to_numeric_vec(y, "y")
+  x <- to_numeric_vec(sealevelts, "sealevelts")
+  stopifnot(all(y >= 0), length(y) == length(x))
+  
+  lag_vec <- function(x, k) c(rep(NA_real_, k), head(x, -k))
+  
+  # Build full lag matrix up to max_lag
+  X_full <- setNames(
+    data.frame(lapply(1:max_lag, function(j) lag_vec(x, j))),
+    paste0("exo_lag", 1:max_lag)
+  )
+  
+  # Use SAME rows for all K
+  keep <- stats::complete.cases(cbind(y, X_full))
+  y_common <- y[keep]
+  X_full   <- X_full[keep, , drop = FALSE]
+  n        <- length(y_common)
+  
+  rows <- vector("list", max_lag)
+  fits <- vector("list", max_lag)
+  coef_tables <- vector("list", max_lag)
+  
+  z_alpha <- qnorm(1 - (1 - ci_level)/2)
+  
+  # ---- HAC robust SEs for tscount::tsglm (Poisson, log link) ----
+  robust_hac_se_tsglm <- function(fit, bw = NULL, kernel = "Bartlett") {
+    if (!requireNamespace("sandwich", quietly = TRUE) ||
+        !requireNamespace("numDeriv", quietly = TRUE)) {
+      stop("Please install packages 'sandwich' and 'numDeriv' for HAC SEs.")
+    }
+    
+    cf    <- stats::coef(fit)
+    theta <- as.numeric(cf); names(theta) <- names(cf)
+    yv    <- as.numeric(fit$ts)
+    Xreg  <- fit$xreg
+    if (is.null(Xreg)) Xreg <- cbind(`(none)` = rep(0, length(yv)))
+    Xreg  <- as.matrix(Xreg)
+    nT    <- length(yv)
+    
+    alpha_names <- grep("^alpha", names(theta), value = TRUE)
+    beta_names  <- grep("^beta",  names(theta), value = TRUE)
+    xreg_names  <- setdiff(names(theta), c("(Intercept)", alpha_names, beta_names))
+    
+    p_ <- length(alpha_names)
+    q_ <- length(beta_names)
+    k_ <- length(xreg_names)
+    
+    if (k_ > 0) {
+      Xk <- if (!is.null(colnames(Xreg)) && all(xreg_names %in% colnames(Xreg))) {
+        Xreg[, xreg_names, drop = FALSE]
+      } else {
+        Xreg[, seq_len(k_), drop = FALSE]
+      }
+    } else {
+      Xk <- matrix(0, nT, 0)
+    }
+    
+    # seed recursion with fitted eta for stability under perturbations
+    eta_seed <- log(as.numeric(fit$fitted))
+    
+    build_eta <- function(par) {
+      b0 <- if ("(Intercept)" %in% names(par)) par["(Intercept)"] else 0
+      bx <- if (k_ > 0) as.numeric(Xk %*% par[xreg_names]) else rep(0, nT)
+      a  <- if (p_ > 0) as.numeric(par[alpha_names]) else numeric(0)
+      b  <- if (q_ > 0) as.numeric(par[beta_names])  else numeric(0)
+      
+      eta <- numeric(nT)
+      m <- max(p_, q_)
+      if (m > 0) eta[1:m] <- eta_seed[1:m]
+      for (t in seq_len(nT)) {
+        if (t <= m) next
+        term_ar <- if (p_ > 0) sum(a * yv[(t-1L):(t-p_)]) else 0
+        term_ma <- if (q_ > 0) sum(b * eta[(t-1L):(t-q_)]) else 0
+        eta[t] <- b0 + bx[t] + term_ar + term_ma
+      }
+      eta
+    }
+    
+    ll_contrib <- function(eta) yv * eta - exp(eta) - lgamma(yv + 1)
+    make_lt <- function(ti) { force(ti); function(par) ll_contrib(build_eta(par))[ti] }
+    
+    # T x p score matrix via numerical gradients of per-time log-likelihood
+    p_dim  <- length(theta)
+    estfun <- matrix(NA_real_, nrow = nT, ncol = p_dim,
+                     dimnames = list(NULL, names(theta)))
+    for (t in seq_len(nT)) {
+      estfun[t, ] <- numDeriv::grad(func = make_lt(t), x = theta, method = "simple")
+    }
+    
+    # bread: inverse Hessian of total log-likelihood
+    full_ll <- function(par) sum(ll_contrib(build_eta(par)))
+    H <- suppressWarnings(numDeriv::hessian(full_ll, theta))
+    bread <- tryCatch(solve(-H),
+                      error = function(e) {
+                        if (!requireNamespace("MASS", quietly = TRUE))
+                          stop("Hessian singular; install 'MASS' for ginv fallback.")
+                        MASS::ginv(-H)
+                      })
+    
+    # meat: HAC long-run covariance of the score matrix (no estfun() generic)
+    if (is.null(bw)) bw <- floor(4 * (nT / 100)^(2/9))  # simple ROT
+    meat <- sandwich::lrvar(estfun, bw = bw, kernel = kernel,
+                            prewhite = FALSE, center = FALSE)
+    
+    V  <- bread %*% meat %*% bread
+    se <- sqrt(diag(V))
+    list(se = se, vcov = V, bw = bw)
+  }
+  
+  for (K in 1:max_lag) {
+    Xk <- X_full[, paste0("exo_lag", 1:K), drop = FALSE]
+    
+    fit <- tscount::tsglm(
+      ts    = y_common,
+      xreg  = Xk,
+      model = list(past_obs = p, past_mean = past_mean),
+      link  = "log",
+      distr = "poisson"
+    )
+    
+    # --- SEs according to choice ---
+    if (se_method == "bootstrap") {
+      se_vec <- as.numeric(tscount::se(fit, B = B))
+      names(se_vec) <- names(stats::coef(fit))
+    } else if (se_method == "hac") {
+      hac <- robust_hac_se_tsglm(fit, bw = hac_bw, kernel = hac_kernel)
+      se_vec <- hac$se
+      names(se_vec) <- names(stats::coef(fit))
+    } else {
+      se_vec <- as.numeric(tscount::se(fit))
+      names(se_vec) <- names(stats::coef(fit))
+    }
+    
+    beta <- stats::coef(fit)
+    zval <- beta / se_vec
+    pval <- 2 * stats::pnorm(abs(zval), lower.tail = FALSE)
+    ci_lo <- beta - z_alpha * se_vec
+    ci_hi <- beta + z_alpha * se_vec
+    coef_tables[[K]] <- data.frame(
+      term = names(beta),
+      estimate = as.numeric(beta),
+      std_error = se_vec,
+      z = as.numeric(zval),
+      p_value = as.numeric(pval),
+      conf_low = as.numeric(ci_lo),
+      conf_high = as.numeric(ci_hi),
+      row.names = NULL
+    )
+    
+    # --- selection stats (your original logic) ---
+    ll    <- as.numeric(logLik(fit))
+    k_par <- attr(logLik(fit), "df")
+    AIC_  <- stats::AIC(fit)
+    AICc_ <- AIC_ + (2 * k_par * (k_par + 1)) / (n - k_par - 1)
+    
+    lrt_p <- NA_real_
+    if (do_lrt && K > 1 && !is.null(fits[[K - 1]])) {
+      ll0  <- as.numeric(logLik(fits[[K - 1]]))
+      df0  <- attr(logLik(fits[[K - 1]]), "df")
+      stat <- 2 * (ll - ll0)
+      ddf  <- k_par - df0
+      lrt_p <- stats::pchisq(stat, df = ddf, lower.tail = FALSE)
+    }
+    
+    fits[[K]] <- fit
+    rows[[K]] <- data.frame(
+      model   = "PARX",
+      p       = p,
+      max_lag = K,
+      n       = n,
+      logLik  = ll,
+      k_par   = k_par,
+      AIC     = AIC_,
+      AICc    = AICc_,
+      BIC     = stats::BIC(fit),
+      LRT_p   = lrt_p,
+      se_method = se_method,
+      B = if (se_method == "bootstrap") B else NA_integer_,
+      row.names = NULL
+    )
+  }
+  
+  out <- do.call(rbind, rows)
+  attr(out, "fits") <- fits
+  attr(out, "coef_tables") <- coef_tables
+  out
+}
+
+# --- Example usage ---
+res <- fit_parx_exolags_same_sample(y_ts, sealevelts, max_lag = 7, p = 1,
+                                    se_method = "hac", hac_kernel = "Bartlett")
+res[which.min(res$BIC), ]# best by BIC
+res[which.min(res$AIC), ]
+attr(res, "coef_tables")[[which.min(res$BIC)]] # HAC-robust coef table
+
+
+acf(y_ts)
+
+
+
+
+#######################################
+
+
+# Backward elimination on exogenous lags using Wald p-values (tscount::tsglm)
+# Backward elimination for exogenous lags in tscount::tsglm
+# Requires: sandwich, numDeriv (and MASS for ginv fallback if Hessian is singular)
+# install.packages(c("sandwich","numDeriv"))  # if needed
+
+backward_parx <- function(
+    y, sealevelts,
+    lags = 1:9,                 # candidate exogenous lags
+    alpha = 0.05,               # significance threshold
+    past_obs = 1, past_mean = 1,
+    verbose = FALSE, max_iter = 100,
+    se_method = c("model","bootstrap","hac"),
+    B = 500,                   # for se_method = "bootstrap"
+    hac_bw = NULL,              # for se_method = "hac"
+    hac_kernel = "Bartlett",    # "Bartlett", "Parzen", "Quadratic"
+    ci_level = 0.95
+) {
+  se_method <- match.arg(se_method)
+  
+  # --- light coercion (accepts ts/zoo/xts/numeric/list-wrapped) ---
+  to_numeric_vec <- function(obj, name = "input") {
+    if (is.list(obj) && length(obj) == 1) obj <- obj[[1]]
+    if (is.ts(obj))           return(as.numeric(obj))
+    if (inherits(obj, c("zoo","xts")) && requireNamespace("zoo", quietly = TRUE))
+      return(as.numeric(zoo::coredata(obj)))
+    if (is.data.frame(obj))   obj <- obj[[1]]
+    if (is.matrix(obj))       obj <- obj[, 1]
+    if (!is.atomic(obj)) stop(sprintf("'%s' could not be coerced to numeric vector", name))
+    as.numeric(obj)
+  }
+  
+  y <- to_numeric_vec(y, "y")
+  x <- to_numeric_vec(sealevelts, "sealevelts")
+  stopifnot(all(y >= 0), length(y) == length(x))
+  
+  lag_vec <- function(v, k) c(rep(NA_real_, k), head(v, -k))
+  
+  # Build full design and lock the sample (same rows every iteration)
+  X_full <- setNames(
+    data.frame(lapply(lags, function(k) lag_vec(x, k))),
+    paste0("Max_dailytemperatur", lags)
+  )
+  keep <- stats::complete.cases(cbind(y, X_full))
+  y_common <- y[keep]
+  X_full   <- X_full[keep, , drop = FALSE]
+  
+  current <- colnames(X_full)
+  steps <- list()
+  
+  # --- HAC robust SEs for tscount::tsglm (Poisson, log link) ---
+  robust_hac_se_tsglm <- function(fit, bw = NULL, kernel = "Bartlett") {
+    if (!requireNamespace("sandwich", quietly = TRUE) ||
+        !requireNamespace("numDeriv", quietly = TRUE)) {
+      stop("Please install packages 'sandwich' and 'numDeriv' for HAC SEs.")
+    }
+    
+    cf    <- stats::coef(fit)
+    theta <- as.numeric(cf); names(theta) <- names(cf)
+    yv    <- as.numeric(fit$ts)
+    Xreg  <- fit$xreg
+    if (is.null(Xreg)) Xreg <- cbind(`(none)` = rep(0, length(yv)))
+    Xreg  <- as.matrix(Xreg)
+    nT    <- length(yv)
+    
+    alpha_names <- grep("^alpha", names(theta), value = TRUE)
+    beta_names  <- grep("^beta",  names(theta), value = TRUE)
+    xreg_names  <- setdiff(names(theta), c("(Intercept)", alpha_names, beta_names))
+    
+    p_ <- length(alpha_names)
+    q_ <- length(beta_names)
+    k_ <- length(xreg_names)
+    
+    if (k_ > 0) {
+      Xk <- if (!is.null(colnames(Xreg)) && all(xreg_names %in% colnames(Xreg))) {
+        Xreg[, xreg_names, drop = FALSE]
+      } else {
+        Xreg[, seq_len(k_), drop = FALSE]
+      }
+    } else {
+      Xk <- matrix(0, nT, 0)
+    }
+    
+    # seed recursion with fitted eta for stability
+    eta_seed <- log(as.numeric(fit$fitted))
+    
+    build_eta <- function(par) {
+      b0 <- if ("(Intercept)" %in% names(par)) par["(Intercept)"] else 0
+      bx <- if (k_ > 0) as.numeric(Xk %*% par[xreg_names]) else rep(0, nT)
+      a  <- if (p_ > 0) as.numeric(par[alpha_names]) else numeric(0)
+      b  <- if (q_ > 0) as.numeric(par[beta_names])  else numeric(0)
+      
+      eta <- numeric(nT)
+      m <- max(p_, q_)
+      if (m > 0) eta[1:m] <- eta_seed[1:m]
+      for (t in seq_len(nT)) {
+        if (t <= m) next
+        term_ar <- if (p_ > 0) sum(a * yv[(t-1L):(t-p_)]) else 0
+        term_ma <- if (q_ > 0) sum(b * eta[(t-1L):(t-q_)]) else 0
+        eta[t] <- b0 + bx[t] + term_ar + term_ma
+      }
+      eta
+    }
+    
+    ll_contrib <- function(eta) yv * eta - exp(eta) - lgamma(yv + 1)
+    make_lt <- function(ti) { force(ti); function(par) ll_contrib(build_eta(par))[ti] }
+    
+    # T x p score matrix via numerical gradients of per-time log-likelihood
+    p_dim  <- length(theta)
+    estfun <- matrix(NA_real_, nrow = nT, ncol = p_dim,
+                     dimnames = list(NULL, names(theta)))
+    for (t in seq_len(nT)) {
+      estfun[t, ] <- numDeriv::grad(func = make_lt(t), x = theta, method = "simple")
+    }
+    
+    # bread: inverse Hessian of total log-likelihood
+    full_ll <- function(par) sum(ll_contrib(build_eta(par)))
+    H <- suppressWarnings(numDeriv::hessian(full_ll, theta))
+    bread <- tryCatch(solve(-H),
+                      error = function(e) {
+                        if (!requireNamespace("MASS", quietly = TRUE))
+                          stop("Hessian singular; install 'MASS' for ginv fallback.")
+                        MASS::ginv(-H)
+                      })
+    
+    # meat: HAC long-run covariance of the score matrix
+    if (is.null(bw)) bw <- floor(4 * (nT / 100)^(2/9))  # simple rule
+    meat <- sandwich::lrvar(estfun, bw = bw, kernel = kernel,
+                            prewhite = FALSE, center = FALSE)
+    
+    V  <- bread %*% meat %*% bread
+    se <- sqrt(diag(V))
+    list(se = se, vcov = V, bw = bw)
+  }
+  
+  # Fit with a given set of columns
+  fit_with <- function(cols) {
+    tscount::tsglm(
+      ts    = y_common,
+      model = list(past_obs = past_obs, past_mean = past_mean),
+      xreg  = if (length(cols)) X_full[, cols, drop = FALSE] else NULL,
+      link  = "log",
+      distr = "poisson"
+    )
+  }
+  
+  # Build a coefficient table using the chosen SE method
+  coef_table <- function(fit) {
+    beta <- stats::coef(fit)
+    if (se_method == "bootstrap") {
+      se_vec <- as.numeric(tscount::se(fit, B = B)); names(se_vec) <- names(beta)
+    } else if (se_method == "hac") {
+      hac <- robust_hac_se_tsglm(fit, bw = hac_bw, kernel = hac_kernel)
+      se_vec <- hac$se; names(se_vec) <- names(beta)
+    } else {
+      se_vec <- as.numeric(tscount::se(fit)); names(se_vec) <- names(beta)
+    }
+    z <- beta / se_vec
+    p <- 2 * stats::pnorm(abs(z), lower.tail = FALSE)
+    z_alpha <- qnorm(1 - (1 - ci_level)/2)
+    data.frame(
+      term = names(beta),
+      Estimate = as.numeric(beta),
+      Std.Error = as.numeric(se_vec),
+      z = as.numeric(z),
+      p_value = as.numeric(p),
+      conf_low = as.numeric(beta - z_alpha * se_vec),
+      conf_high = as.numeric(beta + z_alpha * se_vec),
+      row.names = NULL
+    )
+  }
+  
+  for (iter in seq_len(max_iter)) {
+    fit <- fit_with(current)
+    tab <- coef_table(fit)
+    
+    # Extract exogenous rows (those matching current column names)
+    exo <- tab[tab$term %in% current, , drop = FALSE]
+    if (nrow(exo) == 0) break
+    
+    steps[[iter]] <- data.frame(
+      iter = iter, term = exo$term,
+      estimate = exo$Estimate, se = exo$Std.Error,
+      p_value = exo$p_value, AIC = AIC(fit), BIC = BIC(fit),
+      row.names = NULL
+    )
+    
+    # All significant?
+    if (all(exo$p_value < alpha)) break
+    
+    # Drop the least significant (largest p-value)
+    worst_idx <- which.max(exo$p_value)
+    worst <- exo$term[worst_idx]
+    if (verbose) message(sprintf("Iter %d: dropping %s (p=%.4g)", iter, worst, exo$p_value[worst_idx]))
+    current <- setdiff(current, worst)
+    if (!length(current)) break
+  }
+  
+  final_fit <- fit_with(current)
+  final_tab <- coef_table(final_fit)
+  
+  list(
+    kept_exogenous = current,
+    dropped_order  = setdiff(colnames(X_full), current),
+    final_fit      = final_fit,
+    final_coef_table = final_tab,   # SEs per your chosen method
+    steps          = do.call(rbind, steps),
+    se_method      = se_method
+  )
+}
+
+# --- Example ---
+res <- backward_parx(y_ts, sealevelts, lags = 1:7, alpha = 0.05, 
+                     past_obs = 1, past_mean = 1, verbose = TRUE,
+                     se_method = "bootstrap", hac_kernel = "Bartlett")
+
+res$kept_exogenous
+res$dropped_order
+res$final_coef_table
+summary(res$final_fit)  # model-based summary; use res$final_coef_table for robust SEs
+
+fit <- res$final_fit
+
+summary(fit)
+summary(res)
+                               
+test2 <- make_fit_par1(y_ts)
+summary(test)
+summary(test2)
