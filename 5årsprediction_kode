@@ -1,0 +1,709 @@
+## ============================================================
+## FULL SCRIPT (same as yours, ONLY the fit/predict windows changed)
+## Fit: 1992-08 .. 2009-12
+## Predict (rolling monthly): 2010-01 .. 2018-12
+## ============================================================
+
+# -----------------------
+# Libraries
+# -----------------------
+library(tscount)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(purrr)
+library(ggplot2)
+library(zoo)
+library(strucchange)
+library(lmtest)
+library(sf)
+
+# -----------------------
+# Helper for (Year,Month) indexing
+# -----------------------
+ym_index <- function(y, m) as.integer(y) * 12L + (as.integer(m) - 1L)
+
+FIT_START  <- c(1992L, 8L)   # Aug 1992
+FIT_END    <- c(2013L, 12L)  # Dec 2009
+PRED_START <- c(2014L, 1L)   # Jan 2010
+PRED_END   <- c(2018L, 12L)  # Dec 2018
+
+FIT_START_I  <- ym_index(FIT_START[1],  FIT_START[2])
+FIT_END_I    <- ym_index(FIT_END[1],    FIT_END[2])
+PRED_START_I <- ym_index(PRED_START[1], PRED_START[2])
+PRED_END_I   <- ym_index(PRED_END[1],   PRED_END[2])
+
+# ============================================================
+# 1) Source data -> Europe -> Floods (UNCHANGED)
+# ============================================================
+data <- Disaster_coords_zero_to_capitals_1_
+data$number <- 1L
+
+df_Europa <- subset(data, Region == "Europe" & `Start Year` > 1949 & `Start Year` < 2019)
+df_Europa_flood <- subset(df_Europa, `Disaster Type` == "Flood")
+
+x <- df_Europa_flood$`External IDs`
+df_Europa_flood <- df_Europa_flood[!duplicated(x) | is.na(x), ]
+
+# (keep floods_exo if you use it later for sf matching; it must cover the whole span)
+floods_exo <- subset(
+  df_Europa_flood,
+  `Start Year` > 1992 | (`Start Year` == 1992 & `Start Month` >= 8)
+)
+
+# ============================================================
+# 2) Annual aggregation (UNCHANGED)
+# ============================================================
+agg_year <- aggregate(number ~ `Start Year`, data = df_Europa_flood, sum)
+flood_europa_ts_year <- ts(agg_year$number,
+                           start = min(agg_year$`Start Year`),
+                           frequency = 1)
+
+plot(flood_europa_ts_year,
+     main = "Number of floods in Europe (annual)",
+     xlab = "Year", ylab = "Number of floods")
+
+# ============================================================
+# 3) Monthly aggregation (UNCHANGED; builds full_month and flood_europa_ts_month)
+# ============================================================
+dfm <- df_Europa_flood[
+  !is.na(df_Europa_flood$`Start Year`) &
+    !is.na(df_Europa_flood$`Start Month`) &
+    df_Europa_flood$`Start Month` >= 1 &
+    df_Europa_flood$`Start Month` <= 12,
+]
+
+agg_month <- aggregate(number ~ `Start Year` + `Start Month`, data = dfm, sum)
+
+start_year  <- min(agg_month$`Start Year`)
+end_year    <- 2018L
+
+start_month <- min(agg_month$`Start Month`[agg_month$`Start Year` == start_year])
+end_month   <- 12L
+
+start_date <- as.Date(sprintf("%04d-%02d-01", start_year, start_month))
+end_date   <- as.Date(sprintf("%04d-%02d-01", end_year, end_month))
+
+all_months <- data.frame(date = seq(from = start_date, to = end_date, by = "month"))
+all_months$`Start Year`  <- as.integer(format(all_months$date, "%Y"))
+all_months$`Start Month` <- as.integer(format(all_months$date, "%m"))
+
+full_month <- merge(all_months[, c("Start Year", "Start Month")],
+                    agg_month,
+                    by = c("Start Year", "Start Month"),
+                    all.x = TRUE)
+full_month$number[is.na(full_month$number)] <- 0L
+
+
+
+
+flood_europa_ts_month <- ts(full_month$number,
+                            start = c(start_year, start_month),
+                            frequency = 12)
+
+plot(flood_europa_ts_month,
+     main = "Number of floods in Europe (monthly)",
+     xlab = "Year", ylab = "Number of floods")
+
+print(flood_europa_ts_month)
+# ============================================================
+# 4) Structural break test (UNCHANGED, but run on your chosen series)
+# Here: run on FULL monthly series (same as your original idea)
+# ============================================================
+y_all <- as.numeric(flood_europa_ts_month)
+dat_all <- data.frame(y = y_all)
+fs_all <- Fstats(y ~ 1, data = dat_all)
+
+sbsingle_all <- sctest(fs_all, type = "supF")
+print(sbsingle_all)
+
+bp_all <- breakpoints(fs_all)
+print(bp_all)
+bp_idx <- bp_all$breakpoints[1]
+if (!is.na(bp_idx)) print(time(flood_europa_ts_month)[bp_idx])
+
+# ============================================================
+# 5) >>> CHANGED <<< Build FIT DATA (Aug 1992 .. Dec 2009)
+# This replaces your old floods5 and flood_europa_ts_month_fitdata logic
+# ============================================================
+floods_fit_df <- full_month %>%
+  transmute(Year = as.integer(`Start Year`),
+            Month = as.integer(`Start Month`),
+            number = as.numeric(number)) %>%
+  mutate(ym = ym_index(Year, Month)) %>%
+  filter(ym >= FIT_START_I, ym <= FIT_END_I) %>%
+  arrange(Year, Month)
+
+flood_europa_ts_month_fitdata <- ts(
+  floods_fit_df$number,
+  start = FIT_START,
+  frequency = 12
+)
+
+print(flood_europa_ts_month_fitdata)
+summary(flood_europa_ts_month_fitdata)
+
+# Optional: break test on FIT sample only
+y_fit <- as.numeric(flood_europa_ts_month_fitdata)
+dat_fit <- data.frame(y = y_fit)
+fs_fit <- Fstats(y ~ 1, data = dat_fit)
+print(sctest(fs_fit, type = "supF"))
+print(breakpoints(fs_fit))
+
+# ============================================================
+# 6) PAR grid and basic PAR fit (UNCHANGED except it uses fitdata)
+# ============================================================
+fit_par <- function(p) {
+  tryCatch({
+    fit <- tsglm(flood_europa_ts_month_fitdata,
+                 model = list(past_obs = 1:p, past_mean = 1:p),
+                 distr = "poisson", link  = "log", info = "sandwich")
+    ll <- as.numeric(logLik(fit))
+    k  <- attr(logLik(fit), "df")
+    n  <- length(flood_europa_ts_month_fitdata)
+    
+    tibble(
+      model  = "PAR",
+      p      = p,
+      logLik = ll,
+      k      = k,
+      AIC    = AIC(fit),
+      BIC    = BIC(fit),
+      HQIC   = -2*ll + 2*k*log(log(n))
+    )
+  }, error = function(e) {
+    message("Error at p = ", p, ": ", conditionMessage(e))
+    tibble(model = "PAR", p = p, logLik = NA_real_, k = NA_integer_,
+           AIC = NA_real_, BIC = NA_real_, HQIC = NA_real_)
+  })
+}
+
+max_lag <- 15
+par_grid <- tibble(p = 1:max_lag)
+res_par <- map_dfr(par_grid$p, fit_par)
+print(res_par)
+
+# One baseline PAR model (as in your code)
+fit_month <- tsglm(
+  flood_europa_ts_month_fitdata,
+  model = list(past_obs = 1:4, past_mean = 1:4),
+  link  = "identity",
+  distr = "poisson",
+  info  = "sandwich"
+)
+summary(fit_month)
+acf(fit_month$residuals)
+pacf(fit_month$residuals)
+plot(fit_month$residuals)
+tscount::pit(fit_month)
+
+
+fit_full <- tsglm(
+  flood_europa_ts_month_fitdata,
+  model = list(past_obs =1:4 , past_mean = 1:4),
+  link  = "identity",
+  distr = "poisson",
+  info  = "sandwich"
+)
+
+# Helper to refit the same model with different lag sets
+refit_tsglm <- function(past_obs, past_mean) {
+  tsglm(
+    flood_europa_ts_month_fitdata,
+    model = list(past_obs = past_obs, past_mean = past_mean),
+    link  = "identity",
+    distr = "poisson",
+    info  = "sandwich"
+  )
+}
+
+# Run "drop-1" Wald tests via lmtest::waldtest
+wald_drop1_tsglm <- function(fit_full, past_obs_lags = 1:4, past_mean_lags = 1:4,
+                             alpha = 0.05) {
+  
+  out <- list()
+  
+  # Test each beta_i (past_obs lag i)
+  for (i in past_obs_lags) {
+    fit_red <- refit_tsglm(setdiff(past_obs_lags, i), past_mean_lags)
+    
+    wt <- waldtest(
+      fit_full, fit_red,
+      test = "Chisq",                   # uses vcov(fit_full), which is sandwich here
+      name = function(x) "tsglm"      # avoids relying on formula() names
+    )
+    
+    out[[paste0("past_obs_lag_", i)]] <- wt[nrow(wt), c("Df", "Chisq", "Pr(>Chisq)")]
+  }
+  
+  # Test each alpha_j (past_mean lag j)
+  for (j in past_mean_lags) {
+    fit_red <- refit_tsglm(past_obs_lags, setdiff(past_mean_lags, j))
+    
+    wt <- waldtest(
+      fit_full, fit_red,
+      test = "Chisq",
+      name = function(x) "tsglm"
+    )
+    
+    out[[paste0("past_mean_lag_", j)]] <- wt[nrow(wt), c("Df", "Chisq", "Pr(>Chisq)")]
+  }
+  
+  res <- do.call(rbind, out)
+  res <- data.frame(term = rownames(res), res, row.names = NULL, check.names = FALSE)
+  
+  res$insignificant <- res[["Pr(>Chisq)"]] > alpha
+  res[order(res[["Pr(>Chisq)"]]), ]
+}
+
+res_tests2 <- wald_drop1_tsglm(fit_full, 1:4, 1:4, alpha = 0.05)
+res_tests2
+
+# Which parameters look insignificant at 5%?
+subset(res_tests2, insignificant)
+print(res_tests2)
+
+
+
+
+
+
+# ============================================================
+# 7) EXOG matching block (UNCHANGED logic)
+#     - You create final_by_month_complete here
+#     - I only change the final subsets at the end to match the new windows
+# ============================================================
+
+dfA <- floods_exo
+
+# choose your climate dfB (as in your script, you switch between them)
+# dfB <- HadEX3_Rx5day_Europe_1990_2018
+# dfB <- HadEX3_6month_SPI_Europe_1990_2018
+# dfB <- HadEX3_Rx1day_Europe_1990_2018
+dfB <- HadEX3_Rx5day_Europe_1990_2018
+
+dfA$id <- seq_len(nrow(dfA))
+dfB$id <- seq_len(nrow(dfB))
+
+area_km2 <- 4000
+radius_km <- sqrt(area_km2 / pi)
+radius_m  <- radius_km * 1000
+
+get_year <- function(x) {
+  if (inherits(x, "Date")) return(as.integer(format(x, "%Y")))
+  if (inherits(x, "POSIXt")) return(as.integer(format(x, "%Y")))
+  if (is.numeric(x)) {
+    d <- as.Date(x, origin = "1899-12-30")
+    return(as.integer(format(d, "%Y")))
+  }
+  d1 <- suppressWarnings(as.POSIXct(x, tz = "UTC"))
+  d2 <- suppressWarnings(as.Date(x))
+  d  <- ifelse(is.na(d1), d2, as.Date(d1))
+  out <- as.integer(format(d, "%Y"))
+  na_idx <- is.na(out)
+  if (any(na_idx)) out[na_idx] <- suppressWarnings(as.integer(substr(as.character(x[na_idx]), 1, 4)))
+  out
+}
+
+get_month <- function(x) {
+  if (inherits(x, "Date")) return(as.integer(format(x, "%m")))
+  if (inherits(x, "POSIXt")) return(as.integer(format(x, "%m")))
+  if (is.numeric(x)) {
+    d <- as.Date(x, origin = "1899-12-30")
+    return(as.integer(format(d, "%m")))
+  }
+  d1 <- suppressWarnings(as.POSIXct(x, tz = "UTC"))
+  d2 <- suppressWarnings(as.Date(x))
+  d  <- ifelse(is.na(d1), d2, as.Date(d1))
+  out <- as.integer(format(d, "%m"))
+  na_idx <- is.na(out)
+  if (any(na_idx)) out[na_idx] <- suppressWarnings(as.integer(substr(as.character(x[na_idx]), 6, 7)))
+  out
+}
+
+A_year  <- as.integer(dfA[["Start Year"]])
+A_month <- as.integer(dfA[["Start Month"]])
+
+keepA <- !is.na(A_year) & !is.na(A_month) & A_month >= 1 & A_month <= 12
+dfA_m  <- dfA[keepA, ]
+A_year <- A_year[keepA]
+A_month <- A_month[keepA]
+
+B_year  <- get_year(dfB$time)
+B_month <- get_month(dfB$time)
+
+keepB <- !is.na(B_year) & !is.na(B_month)
+dfB   <- dfB[keepB, ]
+B_year  <- B_year[keepB]
+B_month <- B_month[keepB]
+
+dfB$B_year  <- B_year
+dfB$B_month <- B_month
+dfB$B_row   <- seq_len(nrow(dfB))
+
+A_sf <- st_as_sf(dfA_m, coords = c("longitude_final", "latitude_final"),
+                 crs = 4326, remove = FALSE)
+B_sf <- st_as_sf(dfB, coords = c("longitude", "latitude"),
+                 crs = 4326, remove = FALSE)
+
+dfA_idx <- tibble(
+  A_row   = seq_len(nrow(dfA_m)),
+  A_year  = A_year,
+  A_month = A_month
+)
+
+dfB_idx <- tibble(
+  B_row   = dfB$B_row,
+  B_year  = dfB$B_year,
+  B_month = dfB$B_month
+)
+
+months_in_A <- dfA_idx |>
+  distinct(A_year, A_month) |>
+  arrange(A_year, A_month)
+
+nearest_samemonth_for_month <- function(y, m, A_rows_ym) {
+  B_rows_ym <- dfB_idx$B_row[dfB_idx$B_year == y & dfB_idx$B_month == m]
+  if (!length(A_rows_ym) || !length(B_rows_ym)) {
+    return(tibble(A_row=integer(), B_row=integer(), A_year=integer(), A_month=integer(), B_year=integer(), B_month=integer()))
+  }
+  nn_idx <- st_nearest_feature(A_sf[A_rows_ym, ], B_sf[B_rows_ym, ])
+  tibble(
+    A_row   = A_rows_ym,
+    B_row   = B_rows_ym[nn_idx],
+    A_year  = y,
+    A_month = m,
+    B_year  = y,
+    B_month = m
+  )
+}
+
+selected_pairs_list <- vector("list", nrow(months_in_A))
+
+for (k in seq_len(nrow(months_in_A))) {
+  y <- months_in_A$A_year[k]
+  m <- months_in_A$A_month[k]
+  
+  A_rows_ym <- dfA_idx$A_row[dfA_idx$A_year == y & dfA_idx$A_month == m]
+  B_rows_ym <- dfB_idx$B_row[dfB_idx$B_year == y & dfB_idx$B_month == m]
+  
+  if (!length(B_rows_ym) || !length(A_rows_ym)) {
+    selected_pairs_list[[k]] <- tibble(A_row=integer(), B_row=integer(), A_year=integer(), A_month=integer(), B_year=integer(), B_month=integer())
+    next
+  }
+  
+  hits <- st_is_within_distance(A_sf[A_rows_ym, ], B_sf[B_rows_ym, ], dist = radius_m)
+  has_any <- any(lengths(hits) > 0)
+  
+  if (has_any) {
+    A_rep <- rep(seq_along(hits), lengths(hits))
+    B_rep <- unlist(hits, use.names = FALSE)
+    selected_pairs_list[[k]] <- tibble(
+      A_row   = A_rows_ym[A_rep],
+      B_row   = B_rows_ym[B_rep],
+      A_year  = y, A_month = m,
+      B_year  = y, B_month = m
+    )
+  } else {
+    selected_pairs_list[[k]] <- nearest_samemonth_for_month(y, m, A_rows_ym)
+  }
+}
+
+selected_pairs <- bind_rows(selected_pairs_list)
+
+per_Arow <- selected_pairs |>
+  left_join(
+    dfB |>
+      mutate(B_row = B_row) |>
+      select(B_row, Rx5day),
+    by = "B_row"
+  ) |>
+  group_by(A_row, A_year, A_month) |>
+  summarise(
+    EHF_HWN_median_per_A = mean(Rx5day, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+final_by_month <- per_Arow |>
+  group_by(Year = A_year, Month = A_month) |>
+  summarise(
+    EHF_HWN_final = mean(EHF_HWN_median_per_A, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(Year, Month)
+
+dfB <- dfB |>
+  mutate(station_key = paste0(round(longitude, 6), "_", round(latitude, 6)))
+
+pairs_with_keys <- selected_pairs |>
+  left_join(dfB |> select(B_row, station_key), by = "B_row")
+
+stations_by_disaster_month <- pairs_with_keys |>
+  distinct(A_year, A_month, station_key) |>
+  group_by(A_year, A_month) |>
+  summarise(station_keys = list(unique(na.omit(station_key))), .groups = "drop")
+
+disaster_ym_num <- with(stations_by_disaster_month, sort(unique(A_year * 100L + A_month)))
+all_ym_B_num <- sort(unique(dfB$B_year * 100L + dfB$B_month))
+
+months_no_disaster_num <- setdiff(all_ym_B_num, disaster_ym_num)
+years_no_disaster  <- months_no_disaster_num %/% 100L
+months_no_disaster <- months_no_disaster_num %% 100L
+
+filled_nondisaster <- tibble(
+  Year  = years_no_disaster,
+  Month = months_no_disaster,
+  ym_num = months_no_disaster_num
+) |>
+  mutate(
+    prev_ym_num = purrr::map_int(ym_num, ~{
+      prevs <- disaster_ym_num[disaster_ym_num < .x]
+      if (length(prevs)) max(prevs) else NA_integer_
+    }),
+    prev_year  = prev_ym_num %/% 100L,
+    prev_month = prev_ym_num %% 100L
+  ) |>
+  left_join(stations_by_disaster_month, by = c("prev_year" = "A_year", "prev_month" = "A_month")) |>
+  rowwise() |>
+  mutate(
+    EHF_HWN_final = {
+      keys <- station_keys
+      if (is.null(keys) || length(keys) == 0 || all(is.na(keys))) {
+        NA_real_
+      } else {
+        mean(
+          dfB$Rx5day[
+            dfB$B_year == Year &
+              dfB$B_month == Month &
+              dfB$station_key %in% keys
+          ],
+          na.rm = TRUE
+        )
+      }
+    }
+  ) |>
+  ungroup() |>
+  select(Year, Month, EHF_HWN_final)
+
+final_by_month_complete <- bind_rows(final_by_month, filled_nondisaster) |>
+  arrange(Year, Month)
+
+print(final_by_month_complete, n = nrow(final_by_month_complete))
+
+# ============================================================
+# 8) >>> CHANGED <<< Build Exogene TRAIN (1992-08..2009-12) and PRED (2010-01..2018-12)
+# ============================================================
+make_month_grid <- function(start_ym, end_ym) {
+  start_date <- as.Date(sprintf("%04d-%02d-01", start_ym[1], start_ym[2]))
+  end_date   <- as.Date(sprintf("%04d-%02d-01", end_ym[1],   end_ym[2]))
+  tibble(date = seq(from = start_date, to = end_date, by = "month")) %>%
+    mutate(Year = as.integer(format(date, "%Y")),
+           Month = as.integer(format(date, "%m"))) %>%
+    select(Year, Month)
+}
+
+Exogene_variabler <- make_month_grid(FIT_START, FIT_END) %>%
+  left_join(final_by_month_complete %>%
+              transmute(Year = as.integer(Year), Month = as.integer(Month),
+                        EHF_HWN_final = as.numeric(EHF_HWN_final)),
+            by = c("Year","Month")) %>%
+  arrange(Year, Month)
+
+Exogene_variabler_pred <- make_month_grid(PRED_START, PRED_END) %>%
+  left_join(final_by_month_complete %>%
+              transmute(Year = as.integer(Year), Month = as.integer(Month),
+                        EHF_HWN_final = as.numeric(EHF_HWN_final)),
+            by = c("Year","Month")) %>%
+  arrange(Year, Month)
+
+# fill missing exog (same as your approach)
+if (anyNA(Exogene_variabler$EHF_HWN_final)) {
+  Exogene_variabler$EHF_HWN_final <- zoo::na.locf(Exogene_variabler$EHF_HWN_final, na.rm = FALSE)
+}
+if (anyNA(Exogene_variabler_pred$EHF_HWN_final)) {
+  Exogene_variabler_pred$EHF_HWN_final <- zoo::na.locf(Exogene_variabler_pred$EHF_HWN_final, na.rm = FALSE)
+}
+
+regressor_train <- as.numeric(Exogene_variabler$EHF_HWN_final)
+
+# summer dummy based on TRAIN y_ts cycle (safe and aligned)
+m_fit <- cycle(flood_europa_ts_month_fitdata)
+summer_train <- as.integer(m_fit %in% c(6,7,8))
+
+xreg_train <- cbind(
+  EHF_HWN_final = regressor_train,
+  summer        = summer_train
+)
+
+# prediction xreg block
+xreg_pred <- cbind(
+  EHF_HWN_final = as.numeric(Exogene_variabler_pred$EHF_HWN_final),
+  summer        = as.integer(Exogene_variabler_pred$Month %in% c(6,7,8))
+)
+
+stopifnot(length(as.numeric(flood_europa_ts_month_fitdata)) == nrow(xreg_train))
+
+# ============================================================
+# 9) PARX fit on training (same structure as your code)
+# (You can keep your chosen lags; here I keep your example)
+# ============================================================
+fit_parx1 <- tsglm(
+  flood_europa_ts_month_fitdata,
+  model = list(past_obs =1 , past_mean = NULL),
+  distr = "poisson",
+  link  = "log",
+  xreg  = xreg_train,
+  info  = "sandwich"
+)
+
+summary(fit_parx1)
+acf(fit_parx1$residuals, main = "ACF of the residuals")
+pacf(fit_parx1$residuals, main = "PACF of the residuals")
+tscount::pit(fit_parx1)
+par(mfrow = c(1, 1))
+
+# ============================================================
+# 10) >>> CHANGED <<< Rolling monthly forecasts: 2010-01..2018-12
+# Same procedure as your 2018 block: refit -> 1-step -> append realized
+# ============================================================
+
+# realized y for prediction horizon
+floods_pred_df <- full_month %>%
+  transmute(Year = as.integer(`Start Year`),
+            Month = as.integer(`Start Month`),
+            y = as.numeric(number)) %>%
+  mutate(ym = ym_index(Year, Month)) %>%
+  filter(ym >= PRED_START_I, ym <= PRED_END_I) %>%
+  arrange(Year, Month)
+
+y_future <- floods_pred_df$y
+H <- length(y_future)
+
+# builders (same as your rolling code)
+make_fit_par <- function(y) {
+  tsglm(
+    y,
+    model = list(past_obs =1 , past_mean = NULL),
+    distr = "poisson",
+    link  = "identity",
+    info  = "score"
+  )
+}
+
+make_fit_parx <- function(y, xreg) {
+  tsglm(
+    y,
+    model = list(past_obs =1 , past_mean = NULL),
+    distr = "poisson",
+    link  = "identity",
+    xreg  = xreg,
+    info  = "score"
+  )
+}
+
+roll_forecast_PAR <- function(y_train, y_future, window_length = length(y_train)) {
+  y_hist <- as.numeric(y_train)
+  pred <- rep(NA_real_, length(y_future))
+  
+  for (i in seq_along(y_future)) {
+    from <- max(1, length(y_hist) - window_length + 1)
+    y_win <- y_hist[from:length(y_hist)]
+    fit <- make_fit_par(y_win)
+    
+    pred[i] <- as.numeric(predict(fit, n.ahead = 1)$pred)[1]
+    y_hist <- c(y_hist, y_future[i])
+  }
+  
+  tibble(Year = floods_pred_df$Year,
+         Month = floods_pred_df$Month,
+         actual = as.numeric(y_future),
+         pred = pred,
+         error = actual - pred)
+}
+
+roll_forecast_PARX <- function(y_train, x_train, y_future, x_future,
+                               window_length = length(y_train)) {
+  y_hist <- as.numeric(y_train)
+  x_hist <- as.matrix(x_train)
+  pred <- rep(NA_real_, length(y_future))
+  
+  for (i in seq_along(y_future)) {
+    from <- max(1, length(y_hist) - window_length + 1)
+    y_win <- y_hist[from:length(y_hist)]
+    x_win <- x_hist[from:nrow(x_hist), , drop = FALSE]
+    
+    fit <- make_fit_parx(y_win, x_win)
+    
+    nx <- matrix(x_future[i, ], nrow = 1)
+    colnames(nx) <- colnames(x_win)
+    
+    pred[i] <- as.numeric(predict(fit, n.ahead = 1, newxreg = nx)$pred)[1]
+    
+    y_hist <- c(y_hist, y_future[i])
+    x_hist <- rbind(x_hist, nx)
+  }
+  
+  tibble(Year = floods_pred_df$Year,
+         Month = floods_pred_df$Month,
+         actual = as.numeric(y_future),
+         pred = pred,
+         error = actual - pred)
+}
+
+cmp_PAR  <- roll_forecast_PAR(flood_europa_ts_month_fitdata, y_future,
+                              window_length = length(flood_europa_ts_month_fitdata))
+
+cmp_PARX <- roll_forecast_PARX(flood_europa_ts_month_fitdata, xreg_train,
+                               y_future, xreg_pred,
+                               window_length = length(flood_europa_ts_month_fitdata))
+
+print(cmp_PAR)
+print(cmp_PARX)
+
+# metrics (same as your code, now OOS is 2010-2018)
+msfe <- function(y, lam) mean((y - lam)^2, na.rm = TRUE)
+fs <- function(y, lam) {
+  lam <- pmax(lam, 1e-12)
+  mean(y * log(lam) - lam, na.rm = TRUE)
+}
+
+fit_PAR_in  <- make_fit_par(as.numeric(flood_europa_ts_month_fitdata))
+fit_PARX_in <- make_fit_parx(as.numeric(flood_europa_ts_month_fitdata), as.matrix(xreg_train))
+
+tab_metrics <- tibble(
+  Model = c("PAR", "PARX"),
+  AIC   = c(AIC(fit_PAR_in),  AIC(fit_PARX_in)),
+  BIC   = c(BIC(fit_PAR_in),  BIC(fit_PARX_in)),
+  MSFE  = c(msfe(cmp_PAR$actual,  cmp_PAR$pred),
+            msfe(cmp_PARX$actual, cmp_PARX$pred)),
+  FS    = c(fs(cmp_PAR$actual,  cmp_PAR$pred),
+            fs(cmp_PARX$actual, cmp_PARX$pred))
+) %>% mutate(across(-Model, ~ round(.x, 4)))
+
+print(tab_metrics)
+
+# plot (2010-2018)
+df_plot <- bind_rows(
+  cmp_PAR  %>% transmute(Year, Month, actual, pred, Model = "PAR"),
+  cmp_PARX %>% transmute(Year, Month, actual, pred, Model = "PARX")
+) %>% mutate(date = as.Date(sprintf("%04d-%02d-01", Year, Month)))
+
+ggplot(df_plot, aes(date)) +
+  geom_point(aes(y = actual), color = "black") +
+  geom_line(aes(y = pred, color = Model)) +
+  labs(
+    title = "Observed vs 1-step-ahead rolling forecasts (refit each month, 2014–2018)",
+    x = "Date",
+    y = "Flood count",
+    color = ""
+  ) +
+  theme_minimal()
+
+
+e_par  <- cmp_PAR$actual  - cmp_PAR$pred
+e_parx <- cmp_PARX$actual - cmp_PARX$pred
+
+# Diebold-Mariano test using squared error loss
+dm_se <- dm.test(e1 = e_par, e2 = e_parx, h = 1, power = 2)
+
+print(dm_se)
